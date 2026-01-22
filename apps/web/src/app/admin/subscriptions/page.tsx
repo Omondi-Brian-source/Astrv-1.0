@@ -41,7 +41,7 @@ export default function SubscriptionsPage() {
       const { data, error: loadError } = await supabase
         .from("subscriptions")
         .select(
-          "id, team_id, stripe_subscription_id, plan_name, status, seats_allowed, current_period_end, created_at, updated_at, teams(id, name, owner_user_id)"
+          "id, team_id, stripe_subscription_id, plan_name, status, seats_allowed, current_period_end, created_at, updated_at, teams(id, name, created_at, owner_user_id)"
         )
         .order("created_at", { ascending: false });
 
