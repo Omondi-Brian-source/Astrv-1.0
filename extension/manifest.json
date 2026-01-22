@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Astr",
+  "version": "0.0.1",
+  "description": "Astr AI assistant for chathomebase.com",
+  "action": {
+    "default_title": "Astr"
+  },
+  "permissions": ["scripting", "storage", "sidePanel"],
+  "host_permissions": ["https://chathomebase.com/*"],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  }
+}
