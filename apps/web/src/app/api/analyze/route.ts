@@ -5,6 +5,10 @@ import { NextResponse } from "next/server";
 import { generateGeminiReply } from "../../../lib/geminiClient";
 import { rateLimitUser } from "../../../lib/rateLimiter";
 import { getSupabaseAdminClient } from "../../../lib/supabaseClient";
+import {
+  authAndSubscription,
+  type AuthenticatedRequest,
+} from "../../../middleware/authAndSubscription";
 
 export const runtime = "nodejs";
 
@@ -21,11 +25,6 @@ type AnalyzeRequestBody = {
   length?: string;
 };
 
-type AuthContext = {
-  userId: string;
-  teamId: string;
-};
-
 function errorResponse(status: number, code: string, message: string) {
   return NextResponse.json(
     { error: { code, message } },
@@ -33,13 +32,6 @@ function errorResponse(status: number, code: string, message: string) {
       status,
     }
   );
-}
-
-function parseBearerToken(authHeader: string | null): string | null {
-  if (!authHeader) return null;
-  const [scheme, token] = authHeader.split(" ");
-  if (scheme !== "Bearer" || !token) return null;
-  return token;
 }
 
 function sanitizeText(value: string): string {
@@ -72,82 +64,29 @@ function validateRequest(body: AnalyzeRequestBody) {
   return null;
 }
 
-async function authenticateRequest(token: string): Promise<AuthContext> {
-  const adminClient = getSupabaseAdminClient();
-  const { data, error } = await adminClient.auth.getUser(token);
+function handleAuthError(error: unknown) {
+  const errorCode = (error as Error)?.message ?? "forbidden";
 
-  if (error || !data?.user) {
-    throw new Error("unauthorized");
+  switch (errorCode) {
+    case "missing_token":
+      return errorResponse(401, "unauthorized", "Missing authorization token");
+    case "unauthorized":
+      return errorResponse(401, "unauthorized", "Invalid session token");
+    case "subscription_inactive":
+      return errorResponse(
+        403,
+        "subscription_inactive",
+        "No active subscription for this team."
+      );
+    case "seat_limit_reached":
+      return errorResponse(
+        403,
+        "seat_limit_reached",
+        "All subscription seats are currently in use."
+      );
+    default:
+      return errorResponse(403, "forbidden", "Access denied");
   }
-
-  const userId = data.user.id;
-
-  const { data: teamMember, error: teamError } = await adminClient
-    .from("team_members")
-    .select("team_id")
-    .eq("user_id", userId)
-    .eq("status", "active")
-    .maybeSingle();
-
-  if (teamError) {
-    throw new Error("forbidden");
-  }
-
-  let teamId = teamMember?.team_id as string | undefined;
-
-  if (!teamId) {
-    const { data: fallbackMember } = await adminClient
-      .from("team_members")
-      .select("team_id")
-      .eq("user_id", userId)
-      .eq("is_active", true)
-      .maybeSingle();
-
-    teamId = fallbackMember?.team_id as string | undefined;
-  }
-
-  if (!teamId) {
-    throw new Error("forbidden");
-  }
-
-  const { data: subscription, error: subscriptionError } = await adminClient
-    .from("subscriptions")
-    .select("id")
-    .eq("team_id", teamId)
-    .in("status", ["active", "trialing"])
-    .maybeSingle();
-
-  if (subscriptionError || !subscription) {
-    throw new Error("forbidden");
-  }
-
-  const { data: seat, error: seatError } = await adminClient
-    .from("seats")
-    .select("id")
-    .eq("team_id", teamId)
-    .eq("user_id", userId)
-    .eq("status", "active")
-    .maybeSingle();
-
-  if (seatError) {
-    throw new Error("forbidden");
-  }
-
-  if (!seat) {
-    const { data: fallbackSeat } = await adminClient
-      .from("seats")
-      .select("id")
-      .eq("team_id", teamId)
-      .eq("user_id", userId)
-      .eq("is_active", true)
-      .maybeSingle();
-
-    if (!fallbackSeat) {
-      throw new Error("forbidden");
-    }
-  }
-
-  return { userId, teamId };
 }
 
 function buildPrompt(messages: ChatMessage[], tone: string, length?: string) {
@@ -177,11 +116,7 @@ function buildPrompt(messages: ChatMessage[], tone: string, length?: string) {
     .join("\n");
 }
 
-async function logUsage(
-  userId: string,
-  teamId: string,
-  tokens: number | undefined
-) {
+async function logUsage(teamId: string, tokens: number | undefined) {
   if (!tokens) return;
 
   const adminClient = getSupabaseAdminClient();
@@ -189,10 +124,9 @@ async function logUsage(
 
   try {
     const { data, error } = await adminClient
-      .from("usage_metrics")
-      .select("tokens")
+      .from("usage_aggregates")
+      .select("tokens_used, requests_count")
       .eq("usage_date", usageDate)
-      .eq("user_id", userId)
       .eq("team_id", teamId)
       .maybeSingle();
 
@@ -201,20 +135,22 @@ async function logUsage(
     }
 
     if (!data) {
-      await adminClient.from("usage_metrics").insert({
+      await adminClient.from("usage_aggregates").insert({
         usage_date: usageDate,
-        user_id: userId,
         team_id: teamId,
-        tokens,
+        tokens_used: tokens,
+        requests_count: 1,
       });
       return;
     }
 
     await adminClient
-      .from("usage_metrics")
-      .update({ tokens: (data.tokens ?? 0) + tokens })
+      .from("usage_aggregates")
+      .update({
+        tokens_used: (data.tokens_used ?? 0) + tokens,
+        requests_count: (data.requests_count ?? 0) + 1,
+      })
       .eq("usage_date", usageDate)
-      .eq("user_id", userId)
       .eq("team_id", teamId);
   } catch (error) {
     // Swallow usage logging errors to avoid impacting user response.
@@ -235,25 +171,22 @@ export async function POST(request: Request) {
     return errorResponse(400, "invalid_request", validationError);
   }
 
-  const token = parseBearerToken(request.headers.get("Authorization"));
-  if (!token) {
-    return errorResponse(401, "unauthorized", "Missing authorization token");
+  let authedRequest: AuthenticatedRequest;
+  try {
+    authedRequest = await authAndSubscription(request);
+  } catch (error) {
+    return handleAuthError(error);
   }
 
-  let authContext: AuthContext;
-  try {
-    authContext = await authenticateRequest(token);
-  } catch (error) {
-    if ((error as Error).message === "unauthorized") {
-      return errorResponse(401, "unauthorized", "Invalid session token");
-    }
-    return errorResponse(403, "forbidden", "Access denied");
+  const auth = authedRequest.auth;
+  if (!auth) {
+    return errorResponse(500, "auth_context_missing", "Authentication failed.");
   }
 
   const adminClient = getSupabaseAdminClient();
   const rateLimitResult = await rateLimitUser(
     adminClient,
-    authContext.userId,
+    auth.user.id,
     30
   );
 
@@ -291,11 +224,7 @@ export async function POST(request: Request) {
       );
     }
 
-    await logUsage(
-      authContext.userId,
-      authContext.teamId,
-      geminiResponse.totalTokens
-    );
+    await logUsage(auth.team.id, geminiResponse.totalTokens);
 
     return NextResponse.json({ reply: geminiResponse.text });
   } catch (error) {
